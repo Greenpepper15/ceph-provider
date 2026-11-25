@@ -3,9 +3,10 @@
 
 //go:build ceph_luks_header_session
 
-package cryptsetup_test
+package luksheader_test
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -14,6 +15,20 @@ import (
 	"github.com/ceph/go-ceph/rados"
 	"github.com/ceph/go-ceph/rbd"
 	"github.com/ironcore-dev/ceph-provider/internal/cryptsetup"
+	"github.com/ironcore-dev/ceph-provider/internal/luksheader"
+)
+
+var (
+	oldPassphrase = []byte("old-passphrase")
+	newPassphrase = []byte("new-passphrase")
+
+	// the cost a rotation gives a new keyslot
+	fixedCost = cryptsetup.PBKDF{
+		Type:       cryptsetup.Argon2id,
+		Iterations: 4,
+		MemoryKiB:  64 * 1024,
+		Threads:    4,
+	}
 )
 
 func luks2(passphrase []byte) rbd.EncryptionOptionsLUKS2 {
@@ -35,47 +50,29 @@ func loads(t *testing.T, ioctx *rados.IOContext, name string, passphrase []byte)
 	return img.EncryptionLoad(luks2(passphrase))
 }
 
-// changeHeader stages the LUKS header of the image through librbd, lets
-// change edit it with libcryptsetup and writes it back.
-func changeHeader(t *testing.T, ioctx *rados.IOContext, name string, change func(dev *cryptsetup.Device)) {
+// change runs luksheader.Change on an image handle of its own.
+func change(t *testing.T, ioctx *rados.IOContext, name string, fn func(dev *cryptsetup.Device) error) error {
 	t.Helper()
 	img, err := rbd.OpenImage(ioctx, name, rbd.NoSnapshot)
 	if err != nil {
 		t.Fatalf("open image: %v", err)
 	}
 	defer func() { _ = img.Close() }()
-
-	hdr, err := img.EncryptionLUKSHeaderOpen()
-	if err != nil {
-		t.Fatalf("open header session: %v", err)
-	}
-	defer func() { _ = hdr.Close() }()
-
-	dev, err := cryptsetup.Open(fmt.Sprintf("/proc/self/fd/%d", hdr.Fd()))
-	if err != nil {
-		t.Fatalf("load staged header: %v", err)
-	}
-	change(dev)
-	// libcryptsetup lets go of the file before librbd reads it
-	dev.Close()
-
-	// no other client gets the lock between two writes of the header
-	if err := img.LockAcquire(rbd.LockModeExclusiveTransient); err != nil {
-		t.Fatalf("acquire lock: %v", err)
-	}
-	if err := hdr.Commit(); err != nil {
-		t.Errorf("commit header: %v", err)
-	}
-	if err := img.LockRelease(); err != nil {
-		t.Errorf("release lock: %v", err)
-	}
+	return luksheader.Change(img, fn)
 }
 
-// A passphrase is replaced on an RBD image in two commits: the new
-// keyslot is added and checked, then the old one is removed. Needs a
-// Ceph cluster whose librbd has the header session, named by
+func addNew(dev *cryptsetup.Device) (int, error) {
+	if err := dev.SetPBKDF(fixedCost); err != nil {
+		return -1, fmt.Errorf("set PBKDF: %w", err)
+	}
+	return dev.AddKeyslot(cryptsetup.AnyKeyslot, oldPassphrase, newPassphrase)
+}
+
+// A passphrase is replaced on an RBD image in two changes: the new
+// keyslot is added, then it is checked and the old one is removed. Needs
+// a Ceph cluster whose librbd has the header session, named by
 // CEPH_CONFIG_FILE.
-func TestHeaderSession(t *testing.T) {
+func TestChange(t *testing.T) {
 	conf := os.Getenv("CEPH_CONFIG_FILE")
 	if conf == "" {
 		t.Skip("CEPH_CONFIG_FILE is not set")
@@ -93,7 +90,7 @@ func TestHeaderSession(t *testing.T) {
 	}
 	defer conn.Shutdown()
 
-	pool := fmt.Sprintf("cryptsetup-test-%d", time.Now().UnixNano())
+	pool := fmt.Sprintf("luksheader-test-%d", time.Now().UnixNano())
 	if err := conn.MakePool(pool); err != nil {
 		t.Fatalf("create pool: %v", err)
 	}
@@ -118,16 +115,36 @@ func TestHeaderSession(t *testing.T) {
 		t.Fatalf("format image: %v", err)
 	}
 
-	added := -1
-	changeHeader(t, ioctx, name, func(dev *cryptsetup.Device) {
-		if err := dev.SetPBKDF(fixedCost); err != nil {
-			t.Fatalf("set PBKDF: %v", err)
+	// a change that fails after it edited the staged header writes nothing
+	errStop := errors.New("stop")
+	var kept *cryptsetup.Device
+	err = change(t, ioctx, name, func(dev *cryptsetup.Device) error {
+		kept = dev
+		if _, err := addNew(dev); err != nil {
+			return err
 		}
-		added, err = dev.AddKeyslot(cryptsetup.AnyKeyslot, oldPassphrase, newPassphrase)
-		if err != nil {
-			t.Fatalf("add keyslot: %v", err)
-		}
+		return errStop
 	})
+	if !errors.Is(err, errStop) {
+		t.Fatalf("failed change: got %v, want %v", err, errStop)
+	}
+	if err := loads(t, ioctx, name, newPassphrase); err == nil {
+		t.Error("new passphrase after a failed change: image loads")
+	}
+	// the handle ends with the change
+	if _, err := kept.Keyslots(); !errors.Is(err, cryptsetup.ErrClosed) {
+		t.Errorf("handle after the change: got %v, want %v", err, cryptsetup.ErrClosed)
+	}
+
+	added := -1
+	err = change(t, ioctx, name, func(dev *cryptsetup.Device) error {
+		var err error
+		added, err = addNew(dev)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("add keyslot: %v", err)
+	}
 	if err := loads(t, ioctx, name, newPassphrase); err != nil {
 		t.Fatalf("new passphrase after add: %v", err)
 	}
@@ -135,26 +152,27 @@ func TestHeaderSession(t *testing.T) {
 		t.Errorf("old passphrase after add: %v", err)
 	}
 
-	changeHeader(t, ioctx, name, func(dev *cryptsetup.Device) {
+	err = change(t, ioctx, name, func(dev *cryptsetup.Device) error {
 		// the header that came back from the image has the new keyslot
 		keyslots, err := dev.Keyslots()
 		if err != nil {
-			t.Fatalf("list keyslots: %v", err)
+			return fmt.Errorf("list keyslots: %w", err)
 		}
 		if len(keyslots) != 2 || keyslots[1].ID != added || keyslots[1].PBKDF != fixedCost {
 			t.Errorf("keyslots after add: got %+v, want keyslot %d with %+v", keyslots, added, fixedCost)
 		}
 		if slot, err := dev.CheckPassphrase(added, newPassphrase); err != nil || slot != added {
-			t.Fatalf("new passphrase on keyslot %d: keyslot %d, err %v", added, slot, err)
+			return fmt.Errorf("new passphrase on keyslot %d: keyslot %d, err %v", added, slot, err)
 		}
 		old, err := dev.CheckPassphrase(cryptsetup.AnyKeyslot, oldPassphrase)
 		if err != nil {
-			t.Fatalf("find the old keyslot: %v", err)
+			return fmt.Errorf("find the old keyslot: %w", err)
 		}
-		if err := dev.RemoveKeyslot(old); err != nil {
-			t.Fatalf("remove keyslot %d: %v", old, err)
-		}
+		return dev.RemoveKeyslot(old)
 	})
+	if err != nil {
+		t.Fatalf("remove keyslot: %v", err)
+	}
 	if err := loads(t, ioctx, name, newPassphrase); err != nil {
 		t.Errorf("new passphrase after remove: %v", err)
 	}
