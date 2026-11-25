@@ -22,6 +22,9 @@ import (
 //
 // dev is valid inside change only. Only one Change at a time may run on
 // an image.
+//
+// Once Change has taken the lock, img takes it only when asked to, so a
+// later write on img fails. Use a handle that is closed afterwards.
 func Change(img *rbd.Image, change func(dev *cryptsetup.Device) error) error {
 	hdr, err := img.EncryptionLUKSHeaderOpen()
 	if err != nil {
