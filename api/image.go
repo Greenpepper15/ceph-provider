@@ -4,6 +4,8 @@
 package api
 
 import (
+	"encoding/json"
+
 	apiutils "github.com/ironcore-dev/provider-utils/apiutils/api"
 )
 
@@ -35,6 +37,18 @@ const (
 type Encryption struct {
 	State       EncryptionState `json:"state"`
 	Passphrases [][]byte        `json:"passphrases"`
+}
+
+// UnmarshalJSON also reads a record written before the passphrases were
+// tracked, where the status held only the state, as a string.
+func (e *Encryption) UnmarshalJSON(data []byte) error {
+	var state EncryptionState
+	if err := json.Unmarshal(data, &state); err == nil {
+		*e = Encryption{State: state}
+		return nil
+	}
+	type plain Encryption
+	return json.Unmarshal(data, (*plain)(e))
 }
 
 type EncryptionState string
