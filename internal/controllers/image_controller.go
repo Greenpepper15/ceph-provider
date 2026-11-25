@@ -20,6 +20,7 @@ import (
 	"github.com/go-logr/logr"
 	providerapi "github.com/ironcore-dev/ceph-provider/api"
 	"github.com/ironcore-dev/ceph-provider/internal/encryption"
+	"github.com/ironcore-dev/ceph-provider/internal/luksheader"
 	"github.com/ironcore-dev/ceph-provider/internal/round"
 	"github.com/ironcore-dev/ceph-provider/internal/utils"
 	"github.com/ironcore-dev/ironcore-image/oci/remote"
@@ -526,7 +527,7 @@ func (r *ImageReconciler) updateImage(ctx context.Context, log logr.Logger, ioCt
 	// The encryption header is updated before the size. An attached
 	// encrypted image is larger than its volume by the LUKS header, so
 	// the size step fails for it and would block the rotation.
-	if changed, err := r.updateEncryptionHeader(ctx, image); err != nil {
+	if changed, err := r.updateEncryptionHeader(ctx, log, ioCtx, image); err != nil {
 		return fmt.Errorf("failed to update encryption header: %w", err)
 	} else if changed {
 		log.V(1).Info("Updated encryption header")
@@ -571,33 +572,77 @@ func (r *ImageReconciler) updateImageSize(ctx context.Context, image *providerap
 	return true, nil
 }
 
-func (r *ImageReconciler) updateEncryptionHeader(ctx context.Context, image *providerapi.Image) (changed bool, err error) {
+// updateEncryptionHeader brings the LUKS header of the image to the
+// requested passphrase in two reconciles. The first adds a keyslot for it,
+// the second removes the keyslots of the passphrases before it. The status
+// lists the passphrases the header accepts, so between the two it has both.
+func (r *ImageReconciler) updateEncryptionHeader(ctx context.Context, log logr.Logger, ioCtx *rados.IOContext, image *providerapi.Image) (changed bool, err error) {
 	if image.Spec.Encryption == nil || image.Spec.Encryption.Type == "" || image.Spec.Encryption.Type == providerapi.EncryptionTypeUnencrypted || image.Status.Encryption.State != providerapi.EncryptionStateHeaderSet {
 		return false, nil
 	}
 	requestedPassphrase := image.Spec.Encryption.EncryptedPassphrase
 	currentPassphrases := image.Status.Encryption.Passphrases
 
+	// The stored passphrases are compared after decryption. Two encryptions
+	// of one passphrase differ, because each uses a nonce of its own.
+	requested, err := r.keyEncryption.Decrypt(requestedPassphrase)
+	if err != nil {
+		return false, fmt.Errorf("failed to decrypt requested passphrase: %w", err)
+	}
+	current := make([][]byte, len(currentPassphrases))
 	requestedIndex := -1
 	for i, passphrase := range currentPassphrases {
-		if bytes.Equal(passphrase, requestedPassphrase) {
+		if current[i], err = r.keyEncryption.Decrypt(passphrase); err != nil {
+			return false, fmt.Errorf("failed to decrypt passphrase %d of the header: %w", i, err)
+		}
+		if requestedIndex == -1 && bytes.Equal(current[i], requested) {
 			requestedIndex = i
-			break
 		}
 	}
+
 	if requestedIndex != -1 {
 		// requested passphrase is already set.
-		// TODO: Before removing passphrases from the status, they should be removed from the LUKS header.
-		if len(currentPassphrases) > 1 {
-			newPassphrases := [][]byte{requestedPassphrase}
-			image.Status.Encryption.Passphrases = newPassphrases
-			if _, err = r.images.Update(ctx, image); err != nil {
-				return false, fmt.Errorf("failed to update encryption passphrases of image: %w", err)
-			}
-			r.Eventf(image.Metadata, corev1.EventTypeNormal, "UpdatedEncryptionPassphrasesSucceeded", "UpdateEncryptionPassphrases", "Removed old encryption passphrases")
-			return true, nil
+		if len(currentPassphrases) == 1 {
+			return false, nil
 		}
-		return false, nil
+
+		img, err := openImage(ioCtx, ImageIDToRBDID(image.ID))
+		if err != nil {
+			return false, err
+		}
+		defer closeImage(log, img)
+
+		for i, passphrase := range current {
+			if i == requestedIndex {
+				continue
+			}
+			if err := luksheader.RemovePassphrase(img, requested, passphrase); err != nil && !errors.Is(err, luksheader.ErrSamePassphrase) {
+				r.Eventf(image.Metadata, corev1.EventTypeWarning, "UpdateEncryptionPassphrasesFailed", "UpdateEncryptionPassphrases", "Failed to remove old encryption passphrase: %s", err)
+				return false, fmt.Errorf("failed to remove old passphrase from encryption header: %w", err)
+			}
+		}
+
+		image.Status.Encryption.Passphrases = [][]byte{currentPassphrases[requestedIndex]}
+		if _, err = r.images.Update(ctx, image); err != nil {
+			return false, fmt.Errorf("failed to update encryption passphrases of image: %w", err)
+		}
+		r.Eventf(image.Metadata, corev1.EventTypeNormal, "UpdatedEncryptionPassphrasesSucceeded", "UpdateEncryptionPassphrases", "Removed old encryption passphrases")
+		return true, nil
+	}
+
+	if len(current) == 0 {
+		return false, fmt.Errorf("no passphrase of the encryption header is recorded, cannot add a new one")
+	}
+
+	img, err := openImage(ioCtx, ImageIDToRBDID(image.ID))
+	if err != nil {
+		return false, err
+	}
+	defer closeImage(log, img)
+
+	if err := luksheader.AddPassphrase(img, current[0], requested); err != nil {
+		r.Eventf(image.Metadata, corev1.EventTypeWarning, "UpdateEncryptionPassphrasesFailed", "UpdateEncryptionPassphrases", "Failed to add new encryption passphrase: %s", err)
+		return false, fmt.Errorf("failed to add new passphrase to encryption header: %w", err)
 	}
 
 	image.Status.Encryption.Passphrases = append(currentPassphrases, requestedPassphrase)
