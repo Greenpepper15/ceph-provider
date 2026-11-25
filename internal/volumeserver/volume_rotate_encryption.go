@@ -35,6 +35,12 @@ func (s *Server) RotateVolumeEncryption(ctx context.Context, req *iri.RotateVolu
 		return nil, utils.ConvertInternalErrorToGRPC(fmt.Errorf("failed to get image: %w", err))
 	}
 
+	// A record written before the passphrases were tracked lists none. Its
+	// header has the passphrase of the spec, which is replaced below.
+	if image.Spec.Encryption != nil && image.Status.Encryption.State == api.EncryptionStateHeaderSet && len(image.Status.Encryption.Passphrases) == 0 {
+		image.Status.Encryption.Passphrases = [][]byte{image.Spec.Encryption.EncryptedPassphrase}
+	}
+
 	image.Spec.Encryption = &api.EncryptionSpec{
 		Type:                api.EncryptionTypeEncrypted,
 		EncryptedPassphrase: encryptedPassphrase,
