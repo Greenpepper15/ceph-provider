@@ -15,12 +15,9 @@ import (
 	"github.com/ironcore-dev/ceph-provider/internal/cryptsetup"
 )
 
-// ErrSamePassphrase is returned by Rotate when the old and the new
-// passphrase are equal.
-var ErrSamePassphrase = errors.New("luksheader: old and new passphrase are the same")
-
-// keyslotCost is the key derivation of the keyslot that Rotate adds. It is
-// fixed, so the memory a rotation needs for it is the same on every host.
+// keyslotCost is the key derivation of the keyslot that AddPassphrase
+// adds. It is fixed, so the memory a rotation needs for it is the same on
+// every host.
 var keyslotCost = cryptsetup.PBKDF{
 	Type:       cryptsetup.Argon2id,
 	Iterations: 4,
@@ -28,24 +25,19 @@ var keyslotCost = cryptsetup.PBKDF{
 	Threads:    4,
 }
 
-// Rotate replaces the passphrase of the image in two changes of its
-// header. The first adds a keyslot for newPassphrase. The second checks
-// newPassphrase on the header as the image has it now and removes the
-// keyslot of oldPassphrase. Between the two both passphrases open the
-// image.
+// AddPassphrase adds a keyslot for newPassphrase to the header of the
+// image. passphrase has to open a keyslot of the image. Afterwards both
+// open the image.
 //
-// After an error Rotate can be called again with the same passphrases. It
-// skips what the call before it has done. The note on img at Change holds
+// When newPassphrase opens a keyslot already, nothing is added, so the
+// call can be repeated after an error. The note on img at Change holds
 // here too.
-func Rotate(img *rbd.Image, oldPassphrase, newPassphrase []byte) error {
-	if bytes.Equal(oldPassphrase, newPassphrase) {
+func AddPassphrase(img *rbd.Image, passphrase, newPassphrase []byte) error {
+	if bytes.Equal(passphrase, newPassphrase) {
 		return ErrSamePassphrase
 	}
-
-	added := -1
-	err := Change(img, func(dev *cryptsetup.Device) error {
-		var err error
-		added, err = dev.CheckPassphrase(cryptsetup.AnyKeyslot, newPassphrase)
+	return Change(img, func(dev *cryptsetup.Device) error {
+		_, err := dev.CheckPassphrase(cryptsetup.AnyKeyslot, newPassphrase)
 		if err == nil {
 			// a call before this one added the keyslot
 			return nil
@@ -56,16 +48,26 @@ func Rotate(img *rbd.Image, oldPassphrase, newPassphrase []byte) error {
 		if err := dev.SetPBKDF(keyslotCost); err != nil {
 			return fmt.Errorf("set key derivation: %w", err)
 		}
-		added, err = dev.AddKeyslot(cryptsetup.AnyKeyslot, oldPassphrase, newPassphrase)
+		_, err = dev.AddKeyslot(cryptsetup.AnyKeyslot, passphrase, newPassphrase)
 		return err
 	})
-	if err != nil {
-		return fmt.Errorf("add keyslot for new passphrase: %w", err)
-	}
+}
 
-	err = Change(img, func(dev *cryptsetup.Device) error {
-		if _, err := dev.CheckPassphrase(added, newPassphrase); err != nil {
-			return fmt.Errorf("check new passphrase on keyslot %d: %w", added, err)
+// RemovePassphrase removes the keyslot of oldPassphrase from the header
+// of the image. Before that it checks, on the header as the image has it
+// now, that keepPassphrase opens a keyslot, so the image is never left
+// without a passphrase the caller knows.
+//
+// When oldPassphrase opens no keyslot, nothing is removed, so the call
+// can be repeated after an error. The note on img at Change holds here
+// too.
+func RemovePassphrase(img *rbd.Image, keepPassphrase, oldPassphrase []byte) error {
+	if bytes.Equal(keepPassphrase, oldPassphrase) {
+		return ErrSamePassphrase
+	}
+	return Change(img, func(dev *cryptsetup.Device) error {
+		if _, err := dev.CheckPassphrase(cryptsetup.AnyKeyslot, keepPassphrase); err != nil {
+			return fmt.Errorf("check passphrase to keep: %w", err)
 		}
 		old, err := dev.CheckPassphrase(cryptsetup.AnyKeyslot, oldPassphrase)
 		if errors.Is(err, syscall.EPERM) {
@@ -77,7 +79,22 @@ func Rotate(img *rbd.Image, oldPassphrase, newPassphrase []byte) error {
 		}
 		return dev.RemoveKeyslot(old)
 	})
-	if err != nil {
+}
+
+// Rotate replaces the passphrase of the image in two changes of its
+// header, AddPassphrase and RemovePassphrase. Between the two both
+// passphrases open the image.
+//
+// After an error Rotate can be called again with the same passphrases. It
+// skips what the call before it has done.
+func Rotate(img *rbd.Image, oldPassphrase, newPassphrase []byte) error {
+	if err := AddPassphrase(img, oldPassphrase, newPassphrase); err != nil {
+		if errors.Is(err, ErrSamePassphrase) {
+			return err
+		}
+		return fmt.Errorf("add keyslot for new passphrase: %w", err)
+	}
+	if err := RemovePassphrase(img, newPassphrase, oldPassphrase); err != nil {
 		return fmt.Errorf("remove keyslot of old passphrase: %w", err)
 	}
 	return nil
