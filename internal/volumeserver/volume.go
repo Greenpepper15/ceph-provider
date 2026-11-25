@@ -99,6 +99,22 @@ func (s *Server) getIriVolumeSpec(image *api.Image) (*iri.VolumeSpec, error) {
 	}
 	spec.Class = class
 
+	// volumepoollet compares this with the Secret of the Volume to see
+	// whether a rotation is due, so it is the passphrase the header has.
+	if encryption := image.Spec.Encryption; encryption != nil && encryption.Type == api.EncryptionTypeEncrypted {
+		encryptedPassphrase := encryption.EncryptedPassphrase
+		if passphrases := image.Status.Encryption.Passphrases; len(passphrases) > 0 {
+			encryptedPassphrase = passphrases[0]
+		}
+		passphrase, err := s.keyEncryption.Decrypt(encryptedPassphrase)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decrypt passphrase: %w", err)
+		}
+		spec.Encryption = &iri.EncryptionSpec{
+			SecretData: map[string][]byte{EncryptionSecretDataPassphraseKey: passphrase},
+		}
+	}
+
 	return spec, nil
 }
 
