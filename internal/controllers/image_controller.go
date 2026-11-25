@@ -523,18 +523,21 @@ func (r *ImageReconciler) updateImage(ctx context.Context, log logr.Logger, ioCt
 		return fmt.Errorf("failed to get image size: %w", err)
 	}
 
+	// The encryption header is updated before the size. An attached
+	// encrypted image is larger than its volume by the LUKS header, so
+	// the size step fails for it and would block the rotation.
+	if changed, err := r.updateEncryptionHeader(ctx, image); err != nil {
+		return fmt.Errorf("failed to update encryption header: %w", err)
+	} else if changed {
+		log.V(1).Info("Updated encryption header")
+		return nil
+	}
+
 	requestedSize := round.OffBytes(image.Spec.Size)
 	if changed, err := r.updateImageSize(ctx, image, img, requestedSize); err != nil {
 		return fmt.Errorf("failed to update image size: %w", err)
 	} else if changed {
 		log.V(1).Info("Updated image", "requestedSize", requestedSize, "currentSize", currentImageSize)
-		return nil
-	}
-
-	if changed, err := r.updateEncryptionHeader(ctx, image); err != nil {
-		return fmt.Errorf("failed to update encryption header: %w", err)
-	} else if changed {
-		log.V(1).Info("Updated encryption header")
 		return nil
 	}
 
